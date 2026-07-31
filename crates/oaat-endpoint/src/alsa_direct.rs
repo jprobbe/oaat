@@ -6,6 +6,14 @@ use std::sync::Arc;
 use oaat_core::format::AudioFormat;
 use tracing::{error, info, warn};
 
+/// aplay ALSA ring-buffer size, in microseconds. 0.5s was too small to absorb
+/// network jitter + clock drift on a continuous stream, so the device XRUN'd
+/// repeatedly — audible as frequent micro-dropouts on BOTH live radio (FIP) and
+/// steady FLAC (Qobuz), independent of source. 2s gives aplay enough slack to
+/// ride out jitter without a dropout; the stall watchdog still recovers a real
+/// hang. (`--period-time` is left to aplay's default = buffer/4.)
+const APLAY_BUFFER_TIME_US: &str = "2000000";
+
 pub struct AlsaDirectOutput {
     process: Option<Child>,
     playing: Arc<AtomicBool>,
@@ -125,7 +133,7 @@ impl AlsaDirectOutput {
             let bits = if channels <= 2 { "s32le" } else { "s16le" };
             let alsa_fmt = if bits == "s32le" { "S32_LE" } else { "S16_LE" };
             let cmd = format!(
-                "ffmpeg -hide_banner -loglevel warning -err_detect ignore_err -f flac -i /dev/stdin -f {bits} -ar {sample_rate} -ac {channels} - | aplay -D {device} -f {alsa_fmt} -r {sample_rate} -c {channels} -t raw -q --buffer-time 500000"
+                "ffmpeg -hide_banner -loglevel warning -err_detect ignore_err -f flac -i /dev/stdin -f {bits} -ar {sample_rate} -ac {channels} - | aplay -D {device} -f {alsa_fmt} -r {sample_rate} -c {channels} -t raw -q --buffer-time {APLAY_BUFFER_TIME_US}"
             );
             let child = Command::new("sh")
                 .args(["-c", &cmd])
@@ -155,7 +163,7 @@ impl AlsaDirectOutput {
                     "-c", &channels.to_string(),
                     "-t", "raw",
                     "-q",
-                    "--buffer-time", "500000",
+                    "--buffer-time", APLAY_BUFFER_TIME_US,
                 ])
                 .stdin(Stdio::piped())
                 .stdout(Stdio::null())
