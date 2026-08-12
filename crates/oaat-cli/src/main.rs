@@ -207,7 +207,7 @@ async fn main() {
                     for d in &devices {
                         if let Some(card) = d.split(':').next()
                             && card.strip_prefix("card ").or_else(|| card.strip_prefix("carte ")).is_some()
-                            && let Some(short_name) = d.split(':').nth(1).and_then(|s| s.trim().split_whitespace().next())
+                            && let Some(short_name) = d.split(':').nth(1).and_then(|s| s.split_whitespace().next())
                         {
                             println!("  sysdefault:CARD={short_name}");
                         }
