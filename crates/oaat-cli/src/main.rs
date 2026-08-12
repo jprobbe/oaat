@@ -205,12 +205,11 @@ async fn main() {
                     }
                     println!("\nUsable names for --audio-device:");
                     for d in &devices {
-                        if let Some(card) = d.split(':').nth(0) {
-                            if let Some(_num) = card.strip_prefix("card ").or_else(|| card.strip_prefix("carte ")) {
-                                if let Some(short_name) = d.split(':').nth(1).map(|s| s.trim().split_whitespace().next()).flatten() {
-                                    println!("  sysdefault:CARD={short_name}");
-                                }
-                            }
+                        if let Some(card) = d.split(':').next()
+                            && card.strip_prefix("card ").or_else(|| card.strip_prefix("carte ")).is_some()
+                            && let Some(short_name) = d.split(':').nth(1).and_then(|s| s.split_whitespace().next())
+                        {
+                            println!("  sysdefault:CARD={short_name}");
                         }
                     }
                 }

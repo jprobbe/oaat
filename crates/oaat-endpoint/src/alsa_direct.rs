@@ -329,7 +329,7 @@ impl AlsaDirectOutput {
             Ok(()) => {
                 self.bytes_written += data.len() as u64;
                 let bpf = bytes_per_frame(self.format, self.channels);
-                if bpf > 0 { data.len() / bpf } else { 0 }
+                data.len().checked_div(bpf).unwrap_or(0)
             }
             Err(e) => {
                 error!(error = %e, "ALSA direct write failed");
@@ -471,6 +471,7 @@ fn alsa_format_and_rate(format: AudioFormat, sample_rate: u32) -> Option<(&'stat
     }
 }
 
+#[cfg(test)]
 fn format_to_alsa(format: AudioFormat) -> Option<&'static str> {
     alsa_format_and_rate(format, 44100).map(|(f, _)| f)
 }
