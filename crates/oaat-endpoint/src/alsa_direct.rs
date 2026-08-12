@@ -1,6 +1,6 @@
 use std::io::Write;
-use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use oaat_core::format::AudioFormat;
@@ -11,8 +11,23 @@ use tracing::{error, info, warn};
 /// repeatedly — audible as frequent micro-dropouts on BOTH live radio (FIP) and
 /// steady FLAC (Qobuz), independent of source. 2s gives aplay enough slack to
 /// ride out jitter without a dropout; the stall watchdog still recovers a real
-/// hang. (`--period-time` is left to aplay's default = buffer/4.)
+/// hang. ALSA clamps to the hardware maximum, which some drivers cap in BYTES:
+/// the request that yields 2s at S16/48k grants only 1s at S32/44.1k (#7).
 const APLAY_BUFFER_TIME_US: &str = "2000000";
+
+/// Requested ALSA period. aplay's default is buffer/4 (500ms here); with a
+/// byte-capped driver the buffer is granted as a whole number of periods, so
+/// coarse periods forfeit up to one period of capacity (observed on the
+/// I-Sabre ES9038Q2M: 2 × 500ms granted where the cap allowed ~1.1s, #7).
+/// Finer periods claim the cap almost exactly.
+const APLAY_PERIOD_TIME_US: &str = "125000";
+
+/// Target capacity of the stdin pipe feeding aplay (Linux F_SETPIPE_SZ).
+/// The kernel default (64 KiB ≈ 0.18s at S32/44.1k stereo) barely decouples
+/// us from the device buffer; 1 MiB ≈ 3s of userspace slack absorbs sender
+/// bursts with clean blocking backpressure instead of dropping UDP audio (#7).
+#[cfg(target_os = "linux")]
+const APLAY_STDIN_PIPE_BYTES: libc::c_int = 1 << 20;
 
 pub struct AlsaDirectOutput {
     process: Option<Child>,
@@ -24,6 +39,7 @@ pub struct AlsaDirectOutput {
     format: AudioFormat,
     bytes_written: u64,
     device_name: Option<String>,
+    underruns: Arc<AtomicU64>,
 }
 
 impl AlsaDirectOutput {
@@ -89,7 +105,15 @@ impl AlsaDirectOutput {
             format: AudioFormat::PcmS16le,
             bytes_written: 0,
             device_name: None,
+            underruns: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Total ALSA under/overruns reported by aplay since this output was
+    /// created (cumulative across respawns; PCM path only — the FLAC path
+    /// inherits stderr straight to the service log).
+    pub fn underrun_count(&self) -> u64 {
+        self.underruns.load(Ordering::Relaxed)
     }
 
     pub fn configure(
@@ -133,14 +157,18 @@ impl AlsaDirectOutput {
             let bits = if channels <= 2 { "s32le" } else { "s16le" };
             let alsa_fmt = if bits == "s32le" { "S32_LE" } else { "S16_LE" };
             let cmd = format!(
-                "ffmpeg -hide_banner -loglevel warning -err_detect ignore_err -f flac -i /dev/stdin -f {bits} -ar {sample_rate} -ac {channels} - | aplay -D {device} -f {alsa_fmt} -r {sample_rate} -c {channels} -t raw -q --buffer-time {APLAY_BUFFER_TIME_US}"
+                "ffmpeg -hide_banner -loglevel warning -err_detect ignore_err -f flac -i /dev/stdin -f {bits} -ar {sample_rate} -ac {channels} - | aplay -D {device} -f {alsa_fmt} -r {sample_rate} -c {channels} -t raw -v --buffer-time {APLAY_BUFFER_TIME_US} --period-time {APLAY_PERIOD_TIME_US}"
             );
             let child = Command::new("sh")
                 .args(["-c", &cmd])
+                .env("LC_ALL", "C")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::null())
                 .stderr(Stdio::inherit())
                 .spawn()?;
+            if let Some(stdin) = child.stdin.as_ref() {
+                enlarge_pipe(stdin);
+            }
 
             info!(
                 device,
@@ -155,20 +183,28 @@ impl AlsaDirectOutput {
             let (alsa_fmt, alsa_rate) = alsa_format_and_rate(format, sample_rate)
                 .ok_or_else(|| format!("unsupported format for ALSA direct: {format}"))?;
 
-            let child = Command::new("aplay")
+            let mut child = Command::new("aplay")
                 .args([
                     "-D", &device,
                     "-f", alsa_fmt,
                     "-r", &alsa_rate.to_string(),
                     "-c", &channels.to_string(),
                     "-t", "raw",
-                    "-q",
+                    "-v",
                     "--buffer-time", APLAY_BUFFER_TIME_US,
+                    "--period-time", APLAY_PERIOD_TIME_US,
                 ])
+                .env("LC_ALL", "C")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                .stderr(Stdio::piped())
                 .spawn()?;
+            if let Some(stdin) = child.stdin.as_ref() {
+                enlarge_pipe(stdin);
+            }
+            if let Some(stderr) = child.stderr.take() {
+                spawn_stderr_logger(stderr, Arc::clone(&self.underruns));
+            }
 
             info!(
                 device = %device,
@@ -237,18 +273,9 @@ impl AlsaDirectOutput {
         };
 
         if let Some(status) = child.try_wait().ok().flatten() {
-            let stderr_msg = child.stderr.take()
-                .and_then(|mut e| {
-                    let mut buf = String::new();
-                    std::io::Read::read_to_string(&mut e, &mut buf).ok()?;
-                    Some(buf)
-                })
-                .unwrap_or_default();
-            warn!(
-                exit_code = %status,
-                stderr = %stderr_msg.trim(),
-                "audio output process exited unexpectedly"
-            );
+            // stderr is streamed live by spawn_stderr_logger — the cause is
+            // already in the log as `aplay: …` lines.
+            warn!(exit_code = %status, "audio output process exited unexpectedly");
             self.process = None;
             return 0;
         }
@@ -343,6 +370,57 @@ impl Default for AlsaDirectOutput {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Grow the pipe feeding the audio process so sender bursts are absorbed in
+/// userspace instead of overflowing the UDP socket once the device buffer is
+/// full. Best effort: a refusal (unprivileged cap lowered below 1 MiB) keeps
+/// the kernel default and only costs slack.
+#[cfg(target_os = "linux")]
+fn enlarge_pipe(stdin: &ChildStdin) {
+    use std::os::fd::AsRawFd;
+    let granted = unsafe { libc::fcntl(stdin.as_raw_fd(), libc::F_SETPIPE_SZ, APLAY_STDIN_PIPE_BYTES) };
+    if granted < 0 {
+        warn!(
+            error = %std::io::Error::last_os_error(),
+            "aplay stdin pipe resize refused — keeping kernel default"
+        );
+    } else {
+        info!(bytes = granted, "aplay stdin pipe enlarged");
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn enlarge_pipe(_stdin: &ChildStdin) {}
+
+/// Stream aplay's stderr into the endpoint log. Under/overruns previously
+/// vanished (`-q` recovers XRUNs silently): audible dropouts, zero trace (#8).
+/// `-v` also makes aplay dump the hw params actually granted, exposing a
+/// driver that clamps the requested buffer (#7).
+fn spawn_stderr_logger(stderr: std::process::ChildStderr, underruns: Arc<AtomicU64>) {
+    std::thread::spawn(move || {
+        use std::io::{BufRead, BufReader};
+        for line in BufReader::new(stderr).lines() {
+            let Ok(line) = line else { break };
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if is_xrun_line(line) {
+                let total = underruns.fetch_add(1, Ordering::Relaxed) + 1;
+                warn!(total, "aplay: {line}");
+            } else {
+                info!("aplay: {line}");
+            }
+        }
+    });
+}
+
+/// aplay (LC_ALL=C) reports buffer trouble as `underrun!!! (at least … ms
+/// long)` / `overrun!!!`; snd_pcm_recover-style messages say "xrun".
+fn is_xrun_line(line: &str) -> bool {
+    let l = line.to_ascii_lowercase();
+    l.contains("underrun") || l.contains("overrun") || l.contains("xrun")
 }
 
 /// Expand packed 24-bit little-endian samples (3 bytes) into S32_LE (4 bytes),
@@ -531,6 +609,15 @@ mod tests {
             alsa_format_and_rate(AudioFormat::DsdU8, 5_644_800),
             Some(("DSD_U32_BE", 176_400))
         );
+    }
+
+    #[test]
+    fn xrun_lines_are_detected_others_ignored() {
+        assert!(is_xrun_line("underrun!!! (at least 34.202 ms long)"));
+        assert!(is_xrun_line("overrun!!!"));
+        assert!(is_xrun_line("Suspicious buffer position: xrun detected"));
+        assert!(!is_xrun_line("Playing raw data 'stdin' : Signed 32 bit Little Endian, Rate 44100 Hz, Stereo"));
+        assert!(!is_xrun_line("buffer_size  : 44100"));
     }
 
     #[test]
