@@ -61,10 +61,10 @@ impl AlsaMixer {
         self.set_mute(false);
         info!(card = self.card, "DAC unmuted");
 
-        if let Some(filter) = fir_filter {
-            if self.set_fir_filter(filter) {
-                info!(filter, "FIR filter set");
-            }
+        if let Some(filter) = fir_filter
+            && self.set_fir_filter(filter)
+        {
+            info!(filter, "FIR filter set");
         }
 
         if let Some(vol) = self.get_volume() {
