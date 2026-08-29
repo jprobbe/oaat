@@ -71,6 +71,10 @@ enum Command {
         /// Web UI port (default: 9741)
         #[arg(long)]
         web_port: Option<u16>,
+        /// Advertise native DSD and play via ALSA DSD_U32_BE (USB DACs).
+        /// Opt-in: without this flag (or config dsd=true) behaviour is unchanged.
+        #[arg(long)]
+        dsd: bool,
     },
 
     /// Start an OAAT controller and stream audio (file or sine wave)
@@ -173,6 +177,7 @@ async fn main() {
             tls,
             no_web_ui,
             web_port,
+            dsd,
         } => {
             if list_devices {
                 #[cfg(not(target_os = "linux"))]
@@ -200,12 +205,11 @@ async fn main() {
                     }
                     println!("\nUsable names for --audio-device:");
                     for d in &devices {
-                        if let Some(card) = d.split(':').nth(0) {
-                            if let Some(_num) = card.strip_prefix("card ").or_else(|| card.strip_prefix("carte ")) {
-                                if let Some(short_name) = d.split(':').nth(1).map(|s| s.trim().split_whitespace().next()).flatten() {
-                                    println!("  sysdefault:CARD={short_name}");
-                                }
-                            }
+                        if let Some(card) = d.split(':').next()
+                            && card.strip_prefix("card ").or_else(|| card.strip_prefix("carte ")).is_some()
+                            && let Some(short_name) = d.split(':').nth(1).and_then(|s| s.split_whitespace().next())
+                        {
+                            println!("  sysdefault:CARD={short_name}");
                         }
                     }
                 }
@@ -263,6 +267,8 @@ async fn main() {
             let ep_tls = tls || file_config.endpoint.tls;
             let ep_web_port = web_port.unwrap_or(DEFAULT_WEB_UI_PORT);
             let ep_web_ui = !no_web_ui;
+            // CLI --dsd ORs with config [capabilities] dsd = true
+            let ep_dsd = dsd || file_config.capabilities.dsd;
 
             run_endpoint(
                 ep_name,
@@ -274,6 +280,7 @@ async fn main() {
                 &file_config.dac,
                 ep_web_ui,
                 ep_web_port,
+                ep_dsd,
             )
             .await;
 
@@ -341,6 +348,7 @@ async fn run_endpoint(
     dac_config: &config::DacSection,
     web_ui_enabled: bool,
     web_ui_port: u16,
+    enable_dsd: bool,
 ) {
     let endpoint_id = load_or_create_endpoint_id(&name);
     let control_addr: SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
@@ -376,16 +384,17 @@ async fn run_endpoint(
     if caps_config.flac {
         formats.push(AudioFormat::Flac);
     }
-    if caps_config.dsd {
+    if enable_dsd {
         formats.push(AudioFormat::DsdU8);
         formats.push(AudioFormat::DsdU16le);
         formats.push(AudioFormat::DsdU32le);
+        info!("native DSD capability enabled (ALSA DSD_U32_BE)");
     }
 
     let capabilities = EndpointCapabilities {
         pcm_max_rate: caps_config.pcm_max_rate,
         pcm_max_bits: caps_config.pcm_max_bits,
-        dsd_max_rate: if caps_config.dsd { Some(64) } else { None },
+        dsd_max_rate: if enable_dsd { Some(64) } else { None },
         channels_max: caps_config.channels_max,
         formats,
         volume: None,
@@ -397,7 +406,7 @@ async fn run_endpoint(
     let mdns_caps = oaat_core::capability::Capabilities {
         pcm_max_rate_khz: caps_config.pcm_max_rate / 1000,
         pcm_max_bits: caps_config.pcm_max_bits,
-        dsd_max_multiplier: if caps_config.dsd { Some(64) } else { None },
+        dsd_max_multiplier: if enable_dsd { Some(64) } else { None },
         flac: caps_config.flac,
         opus: false,
         truehd: false,
